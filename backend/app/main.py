@@ -2,7 +2,7 @@ import os, hmac, hashlib
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-
+from .services.typeform_mapper import extract_response_fields
 from .db import get_db
 from .init_db import init_db
 from .models import Ping, TypeformResponse
@@ -63,25 +63,72 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
     if not verify_typeform_signature(raw, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    data = await request.json()
-
-    # Typeform structure: data["form_response"] {...}
-    frm = data.get("form_response", {})
+    payload = await request.json()
+    frm = payload.get("form_response", {}) or {}
     form_id = frm.get("form_id")
-    submission_id = data.get("event_id") or frm.get("token")
-    answers = frm.get("answers", [])
-    hidden = frm.get("hidden", {})  # contains user_id if you passed it in URL
+    submission_id = payload.get("event_id") or frm.get("token")
+    answers = frm.get("answers", []) or []
+    hidden = frm.get("hidden", {}) or {}
 
+    # identify the user if you pass hidden fields
+    email = hidden.get("email")         # optional
+    user_id = hidden.get("user_id")     # optional (UUID string you pass in URL)
 
-    existing = db.query(TypeformResponse).filter(TypeformResponse.submission_id == submission_id).first()
-    if not existing:
-        row = TypeformResponse(
-            user_id=None,  # populate later if have users
-            form_id=form_id,
-            submission_id=submission_id,
-            answers=answers
-        )
-        db.add(row)
+    # build the new columns from answers
+    fields = extract_response_fields(answers)
+
+    # Upsert by submission_id (idempotent)
+    existing = db.query(TypeformResponse).filter(
+        TypeformResponse.submission_id == submission_id
+    ).first()
+
+    if existing:
+        # update the new fields on the existing row
+        for k, v in fields.items():
+            setattr(existing, k, v)
+        # also update optional email link if you have it
+        if email and not existing.email:
+            existing.email = email
         db.commit()
+        return {"ok": True, "updated": True, "submission_id": submission_id}
 
-    return {"ok": True}
+    # Create new row
+    row = TypeformResponse(
+        form_id=form_id,
+        submission_id=submission_id,
+        answers=answers,
+        email=email,         # optional convenience
+        user_id=None,        # set if you resolve user_id -> users.id
+        **fields
+    )
+    db.add(row)
+    db.commit()
+    return {"ok": True, "created": True, "submission_id": submission_id}
+
+# Debug 
+@app.get("/debug/latest")
+def latest(db: Session = Depends(get_db)):
+    row = (db.query(TypeformResponse)
+           .order_by(TypeformResponse.received_at.desc())
+           .first())
+    if not row:
+        return {"found": False}
+    return {
+        "found": True,
+        "submission_id": row.submission_id,
+        "answers": row.answers,
+        "mapped": {
+            "name": row.name,
+            "email": row.email,
+            "career_level": row.career_level,
+            "career_goal": row.career_goal,
+            "industry": row.industry,
+            "target_role": row.target_role,
+            "skills": row.skills,
+            "career_challenges": row.career_challenges,
+            "coaching_style": row.coaching_style,
+            "target_timeline": row.target_timeline,
+            "study_time": row.study_time,
+            "pressure_response": row.pressure_response
+        }
+    }
