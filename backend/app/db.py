@@ -12,18 +12,14 @@ if not DATABASE_URL:
 # Engine
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,    # drops dead connections cleanly
+    pool_pre_ping=True,   
     echo=True, 
     future=True
 )
 
-# Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Base class for models
 Base = declarative_base()
 
-# Dependency to get a DB session per-request in FastAPI
 def get_db():
     db = SessionLocal()
     try:

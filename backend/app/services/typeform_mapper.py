@@ -7,13 +7,14 @@ REF_TO_COLUMN = {
     "career_level": "career_level",
     "career_goal": "career_goal",
     "industry": "industry",
+    "tech_stack" : "tech_stack",
     "target_role": "target_role",
     "skills": "skills",
     "career_challenges": "career_challenges",
     "coaching_style": "coaching_style",
     "target_timeline": "target_timeline",
     "study_time": "study_time",
-    "pressure-response": "pressure_response",
+    "pressure_response": "pressure_response"
 }
 
 def _get_text(a: Dict[str, Any]) -> Optional[str]:
@@ -34,9 +35,11 @@ def extract_response_fields(answers: List[Dict[str, Any]]) -> Dict[str, Any]:
     Handles text, single choice, multiple choices, and number types.
     """
     out: Dict[str, Any] = {
+        "name": None,
         "career_level": None,
         "career_goal": None,
         "industry": None,
+        "tech_stack": None,
         "target_role": None,
         "skills": None,               
         "career_challenges": None,   

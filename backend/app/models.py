@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, TIMESTAMP, text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from .db import Base
+from sqlalchemy.orm import relationship
 
 class Ping(Base):
     __tablename__ = "ping"
@@ -10,9 +11,10 @@ class Ping(Base):
 class User(Base):
     __tablename__ = "users"
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    name = Column(String)
     email = Column(String, unique=True, index=True)
     created_at = Column(TIMESTAMP, server_default=text("now()"))
-    
+    responses = relationship("TypeformResponse", backref="user", cascade="all, delete-orphan")
 
 class TypeformResponse(Base):
     __tablename__ = "typeform_responses"
@@ -24,8 +26,6 @@ class TypeformResponse(Base):
     received_at = Column(TIMESTAMP, server_default=text("now()"))
 
     # User profiles
-    name = Column(String)
-    email = Column(String, nullable=True)
     career_level = Column(String, nullable=True)
     career_goal = Column(String, nullable=True)
     industry = Column(String, nullable=True)
@@ -36,4 +36,12 @@ class TypeformResponse(Base):
     target_timeline = Column(String, nullable=True)
     study_time = Column(String, nullable=True)
     pressure_response = Column(String, nullable=True)
-   
+
+class LearningPlan(Base):
+    __tablename__ = "learning_plans"
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))     
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    plan = Column(JSONB, nullable=False)
+    model = Column(String, default="gpt-4o")
+    input_signature = Column(String, index=True)
+    created_at = Column(TIMESTAMP, server_default=text("now()"))
