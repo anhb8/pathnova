@@ -16,6 +16,12 @@ const Home = () => {
     }).open();
   };
 
+  const onLoginClick = (e) => {
+    e?.preventDefault?.();
+    console.log("Log In clicked → navigating to /auth");
+    navigate("/auth");
+  };
+
   return (
     <div className="landing-wrapper">
       <nav className="navbar">
@@ -24,7 +30,10 @@ const Home = () => {
           <span className="nav-link inactive">Overview</span>
           <span className="nav-link active">Features</span>
           <span className="nav-link">FAQ</span>
-          <button className="signin-btn">Sign In</button>
+          <button className="signin-btn" onClick={onLoginClick}>
+            Sign In
+          </button>
+
         </div>
       </nav>
 

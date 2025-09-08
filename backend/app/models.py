@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, TIMESTAMP, text, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, TIMESTAMP, text, ForeignKey, UniqueConstraint, Text, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from .db import Base
 from sqlalchemy.orm import relationship
@@ -15,6 +15,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     created_at = Column(TIMESTAMP, server_default=text("now()"))
     responses = relationship("TypeformResponse", backref="user", cascade="all, delete-orphan")
+    providers = relationship("AuthProvider", back_populates="user", cascade="all, delete-orphan")
 
 class TypeformResponse(Base):
     __tablename__ = "typeform_responses"
@@ -45,3 +46,14 @@ class LearningPlan(Base):
     model = Column(String, default="gpt-4o")
     input_signature = Column(String, index=True)
     created_at = Column(TIMESTAMP, server_default=text("now()"))
+
+class AuthProvider(Base):
+    __tablename__ = "auth_providers"
+    provider = Column(Text, primary_key=True)
+    provider_user_id = Column(Text, primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    email_at_link_time = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_login_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="providers")

@@ -1,16 +1,20 @@
 import os, hmac, hashlib, json
-from fastapi import FastAPI, Depends, Request, HTTPException, Query, Body
+from fastapi import FastAPI, Depends, Request, HTTPException, Query, Body, Cookie, Response
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
 from .services.typeform_mapper import extract_response_fields
 from .services.plan_inputs import build_user_context, signature_for_context
 from .services.generate_plan import generate_learning_plan, OPENAI_MODEL
 from .db import get_db
 from .init_db import init_db
-from .schemas import GeneratePlanRequest, LearningPlanResponse
-from .models import Ping, TypeformResponse, User, LearningPlan
+from .schemas import GeneratePlanRequest, LearningPlanResponse, GoogleTokenIn
+from .models import Ping, TypeformResponse, User, LearningPlan, AuthProvider
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from google.oauth2 import id_token
+from google.auth.transport import requests as grequests
 from pydantic import BaseModel
 from typing import Optional, Tuple, Dict, List, Any
+import jwt
 
 app = FastAPI(title="PathNova API")
 
@@ -269,3 +273,107 @@ def generate_plan(req: GeneratePlanRequest = Body(...), db: Session = Depends(ge
         model=OPENAI_MODEL,
         plan=plan
     )
+
+# ------------ Google Auth helpers & routes ------------
+
+JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
+JWT_DAYS = int(os.getenv("JWT_DAYS", "7"))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+
+def make_jwt(uid: str) -> str:
+    payload = {
+        "uid": uid,
+        "jti": str(uuid.uuid4()),
+        "exp": dt.datetime.utcnow() + dt.timedelta(days=JWT_DAYS),
+        "iat": dt.datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def read_jwt(token: str) -> str:
+    data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    return data["uid"]
+
+def require_user(session: str | None = Cookie(default=None), db: Session = Depends(get_db)) -> User:
+    if not session:
+        raise HTTPException(status_code=401, detail="No session")
+    try:
+        uid = read_jwt(session)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    user = db.get(User, uid)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+@app.post("/auth/google")
+def auth_google(body: GoogleTokenIn, response: Response, db: Session = Depends(get_db)):
+    # 1) Verify Google ID token
+    try:
+        claims = id_token.verify_oauth2_token(
+            body.id_token, grequests.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    sub = claims.get("sub")
+    email = (claims.get("email") or "").lower()
+    name = claims.get("name") or None
+    if not sub:
+        raise HTTPException(status_code=400, detail="Missing Google sub")
+
+    # 2) Find existing mapping
+    ap = db.query(AuthProvider).filter_by(provider="google", provider_user_id=sub).one_or_none()
+
+    if ap:
+        user = db.get(User, ap.user_id)
+        ap.last_login_at = dt.datetime.utcnow()
+        if not user:
+            # dangling mapping (rare) — unlink & create proper user
+            db.delete(ap)
+            user = None
+    else:
+        user = db.query(User).filter_by(email=email).one_or_none()
+        if not user:
+            # create user with generated UUID (from DB default gen_random_uuid())
+            # If your users.id is generated in DB, you must INSERT via raw SQL or fetch the id after insert.
+            # Easiest: let DB default fill id; then refresh.
+            user = User(email=email, name=name)
+            db.add(user)
+            db.flush()  # get user.id from DB
+        else:
+            if name and user.name != name:
+                user.name = name
+
+        ap = AuthProvider(
+            provider="google",
+            provider_user_id=sub,
+            user_id=user.id,
+            email_at_link_time=email or None,
+        )
+        db.add(ap)
+
+    db.commit()
+
+    # 3) Set session cookie
+    token = make_jwt(str(user.id))
+    response.set_cookie(
+        key="session",
+        value=token,
+        httponly=True,
+        secure=False,     # set True in production with HTTPS
+        samesite="lax",
+        max_age=JWT_DAYS * 24 * 3600,
+        path="/",
+    )
+
+    return {"ok": True, "user": {"id": str(user.id), "email": user.email, "name": user.name}}
+
+@app.get("/auth/me")
+def auth_me(current: User = Depends(require_user)):
+    return {"id": str(current.id), "email": current.email, "name": current.name}
+
+@app.post("/auth/logout")
+def auth_logout(response: Response):
+    # Clear cookie
+    response.delete_cookie("session", path="/")
+    return {"ok": True}
