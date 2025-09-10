@@ -466,7 +466,7 @@ async def google_callback(request: Request, response: Response, code: str, db: S
     token = make_jwt(str(user.id))
 
     # Redirect the user to the Dashboard page as "logged in".
-    redirect = RedirectResponse(url=f"{FRONTEND_URL}/plan")
+    redirect = RedirectResponse(url=f"{FRONTEND_URL}/dashboard")
     redirect.set_cookie(
         key="session",
         value=token,

@@ -1,8 +1,10 @@
 import { Routes, Route, Navigate} from 'react-router-dom';
 import Home from './Home/Home';
 import Form from './TypeForm/TypeForm';
-import AuthOptions from './Home/AuthOptions';
-import { AuthProvider } from "./auth";
+import AuthOptions from './Auth/AuthOptions';
+import { AuthProvider } from "./Auth/auth";
+import Protected from "./Auth/Protected";
+import Dashboard from './Dashboard/Dashboard';
 
 function App() {
   return (
@@ -13,6 +15,11 @@ function App() {
         <Route path="/form" element={<Form />} />
         <Route path="/auth" element={<AuthOptions />} />
         <Route path="*" element={<Navigate to="/" />} />
+        <Route path="/dashboard" element={
+            <Protected>
+              <Dashboard />
+            </Protected>
+          } />
       </Routes>
     </AuthProvider>
     </>
