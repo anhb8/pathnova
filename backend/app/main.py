@@ -1,6 +1,7 @@
-import os, hmac, hashlib, json
+import os, datetime as dt, uuid, urllib.parse as urlparse, httpx
 from fastapi import FastAPI, Depends, Request, HTTPException, Query, Body, Cookie, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from .services.typeform_mapper import extract_response_fields
 from .services.plan_inputs import build_user_context, signature_for_context
 from .services.generate_plan import generate_learning_plan, OPENAI_MODEL
@@ -15,15 +16,19 @@ from google.auth.transport import requests as grequests
 from pydantic import BaseModel
 from typing import Optional, Tuple, Dict, List, Any
 import jwt
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI(title="PathNova API")
-
 TYPEFORM_SECRET = os.getenv("TYPEFORM_SECRET")
 
 # Allow React dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev URL
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",  # include both to be safe during dev
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -275,10 +280,12 @@ def generate_plan(req: GeneratePlanRequest = Body(...), db: Session = Depends(ge
     )
 
 # ------------ Google Auth helpers & routes ------------
-
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 JWT_DAYS = int(os.getenv("JWT_DAYS", "7"))
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")          
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 def make_jwt(uid: str) -> str:
     payload = {
@@ -307,7 +314,7 @@ def require_user(session: str | None = Cookie(default=None), db: Session = Depen
 
 @app.post("/auth/google")
 def auth_google(body: GoogleTokenIn, response: Response, db: Session = Depends(get_db)):
-    # 1) Verify Google ID token
+    # Verify Google ID token
     try:
         claims = id_token.verify_oauth2_token(
             body.id_token, grequests.Request(), GOOGLE_CLIENT_ID
@@ -321,7 +328,7 @@ def auth_google(body: GoogleTokenIn, response: Response, db: Session = Depends(g
     if not sub:
         raise HTTPException(status_code=400, detail="Missing Google sub")
 
-    # 2) Find existing mapping
+    # Find existing mapping
     ap = db.query(AuthProvider).filter_by(provider="google", provider_user_id=sub).one_or_none()
 
     if ap:
@@ -335,11 +342,10 @@ def auth_google(body: GoogleTokenIn, response: Response, db: Session = Depends(g
         user = db.query(User).filter_by(email=email).one_or_none()
         if not user:
             # create user with generated UUID (from DB default gen_random_uuid())
-            # If your users.id is generated in DB, you must INSERT via raw SQL or fetch the id after insert.
-            # Easiest: let DB default fill id; then refresh.
+            # If users.id is generated in DB, you must INSERT via raw SQL or fetch the id after insert
             user = User(email=email, name=name)
             db.add(user)
-            db.flush()  # get user.id from DB
+            db.flush()  
         else:
             if name and user.name != name:
                 user.name = name
@@ -354,7 +360,7 @@ def auth_google(body: GoogleTokenIn, response: Response, db: Session = Depends(g
 
     db.commit()
 
-    # 3) Set session cookie
+    # Set session cookie
     token = make_jwt(str(user.id))
     response.set_cookie(
         key="session",
@@ -377,3 +383,98 @@ def auth_logout(response: Response):
     # Clear cookie
     response.delete_cookie("session", path="/")
     return {"ok": True}
+
+# redirect user to Google's consent screen
+@app.get("/auth/google/start")
+def google_start():
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",    
+        "prompt": "consent",          
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlparse.urlencode(params)
+    return RedirectResponse(url)
+
+# Exchange code for tokens using Google's token endpoint
+@app.get("/auth/google/callback")
+async def google_callback(request: Request, response: Response, code: str, db: Session = Depends(get_db)):   
+    async with httpx.AsyncClient(timeout=10) as client:
+        token_res = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if token_res.status_code != 200:
+        raise HTTPException(status_code=401, detail="Token exchange failed")
+
+    token_data = token_res.json()
+    id_token_str = token_data.get("id_token")
+    if not id_token_str:
+        raise HTTPException(status_code=401, detail="No id_token in response")
+
+    # Verify the ID token with Google
+    try:
+        claims = id_token.verify_oauth2_token(id_token_str, grequests.Request(), GOOGLE_CLIENT_ID)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    # Extract identity claims
+    sub = claims.get("sub")                   
+    email = (claims.get("email") or "").lower()  
+    name = claims.get("name") or None
+    if not sub:
+        raise HTTPException(status_code=400, detail="Missing Google sub")
+
+    # Upsert user & provider mapping
+    ap = db.query(AuthProvider).filter_by(provider="google", provider_user_id=sub).one_or_none()
+    if ap:
+        user = db.get(User, ap.user_id)
+        ap.last_login_at = dt.datetime.utcnow()
+        if not user:
+            db.delete(ap)
+            user = None
+    else:
+        user = db.query(User).filter_by(email=email).one_or_none()
+        if not user:
+            user = User(email=email, name=name)
+            db.add(user)
+            db.flush()  
+        else:
+            if name and user.name != name:
+                user.name = name
+
+        ap = AuthProvider(
+            provider="google",
+            provider_user_id=sub,
+            user_id=user.id,
+            email_at_link_time=email or None,
+        )
+        db.add(ap)
+
+    db.commit()
+
+    # Create session cookie
+    token = make_jwt(str(user.id))
+
+    # Redirect the user to the Dashboard page as "logged in".
+    redirect = RedirectResponse(url=f"{FRONTEND_URL}/plan")
+    redirect.set_cookie(
+        key="session",
+        value=token,
+        httponly=True,       
+        secure=False,        
+        samesite="lax",
+        max_age=7 * 24 * 3600,
+        path="/",
+    )
+
+    return redirect
