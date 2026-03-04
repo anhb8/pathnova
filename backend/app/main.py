@@ -1,10 +1,10 @@
 import os, datetime as dt, uuid, urllib.parse as urlparse, httpx
-from fastapi import FastAPI, Depends, Request, HTTPException, Query, Body, Cookie, Response
+from fastapi import FastAPI, Depends, Request, HTTPException, Query, Body, Cookie, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from .services.typeform_mapper import extract_response_fields
 from .services.plan_inputs import build_user_context, signature_for_context
-from .services.generate_plan import generate_learning_plan, OPENAI_MODEL
+from .services.generate_plan import generate_plan_from_response, generate_learning_plan, OPENAI_MODEL
 from .db import get_db
 from .init_db import init_db
 from .schemas import GeneratePlanRequest, LearningPlanResponse, GoogleTokenIn
@@ -90,28 +90,6 @@ def extract_name_email_from_answers(answers: List[Dict[str, Any]]) -> Dict[str, 
             if txt and not name:
                 name = txt
 
-    # name_refs  = {"name"}
-    # email_refs = {"email"}
-
-    # for ans in answers or []:
-    #     ref = (ans.get("field", {}) or {}).get("ref")
-
-    #     if ref in name_refs:
-    #         if "text" in ans and ans["text"]:
-    #             candidate = ans["text"].strip()
-    #             if candidate:
-    #                 name = candidate
-
-    #     if ref in email_refs:
-    #         if "email" in ans and ans["email"]:
-    #             candidate = ans["email"].strip()
-    #             if candidate:
-    #                 email = candidate
-
-    #     # if both found
-    #     if name and email:
-    #         break
-
     return {"name": name, "email": normalize_email(email)}
 
 def get_or_create_user_by_email( db: Session, *, email: Optional[str], name: Optional[str]) -> Tuple[Optional[User], bool, bool]:
@@ -137,9 +115,8 @@ def get_or_create_user_by_email( db: Session, *, email: Optional[str], name: Opt
 
     return user, True, False
 
-@app.post("/webhooks/typeform/")
 @app.post("/webhooks/typeform")
-async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
+async def typeform_webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     raw = await request.body()
     signature = request.headers.get("Typeform-Signature")
 
@@ -163,11 +140,11 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
     # build the new columns from answers
     fields = extract_response_fields(answers) or {}
 
-    email = email or fields.get("email") 
+    email = email or fields.get("email") or hidden.get("email")
     name = name or fields.get("name")
 
     # Upsert user first 
-    # user = created = updated = None
+    user = created = updated = None
     if email:
         user, created, updated = get_or_create_user_by_email(db, email=email, name=name)
         db.flush()
@@ -187,11 +164,7 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
                 setattr(resp, k, v)
         db.commit()
         return {"ok": True, "updated": True, "submission_id": submission_id, "user_id": resp.user_id}
-
-    print("email:", email)
-    print("user:", user)
-    print("user.id:", getattr(user, "id", None))
-
+    
     # Create a new response row
     create_kwargs = {
         "user_id": (user.id if user else None),
@@ -199,14 +172,20 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
         "submission_id": submission_id,
         "answers": answers,
         # unpack additional mapped fields
-        **{k: v for k, v in (fields or {}).items() if hasattr(TypeformResponse, k)}
+        **{k: v for k, v in fields.items() if k != "answers" and hasattr(TypeformResponse, k)}
+        
+        # **{k: v for k, v in (fields or {}).items() if hasattr(TypeformResponse, k)}
     }
 
     new_resp = TypeformResponse(**create_kwargs)
     db.add(new_resp)
 
-    # Ccommit persists user and response table
+    # Commit persists user and response table
     db.commit()
+    db.refresh(new_resp)
+
+    background_tasks.add_task(generate_plan_from_response, new_resp.id)
+    print("PLAN JOB QUEUED FOR:", new_resp.id)
     return {"ok": True, "created": True, "submission_id": submission_id}
 
 

@@ -3,7 +3,8 @@ from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 from openai import OpenAI
 from ..models import TypeformResponse, LearningPlan, User
-
+from app.db import SessionLocal
+from .plan_inputs import build_user_context, signature_for_context
 
 TEST_LLM = os.getenv("TEST_LLM", "").lower() in ("1", "true", "yes")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
@@ -113,7 +114,64 @@ VALIDATION RUBRIC (self-check before responding):
 - JSON parses as a single object 
 """
 
+def generate_plan_from_response(response_id, regenerate: bool = False):
+    db = SessionLocal()
+    try:
+        resp = db.query(TypeformResponse).filter(TypeformResponse.id == response_id).first()
+        if not resp:
+            print("plan job: no typeform response", response_id)
+            return
+
+        # Prefer resp.email if you store it; fallback to user.email if user_id exists
+        email = getattr(resp, "email", None)
+        if not email and resp.user_id:
+            user = db.query(User).filter(User.id == resp.user_id).first()
+            email = user.email if user else None
+
+        if not email:
+            print("plan job: missing email; cannot build context")
+            return
+
+        # Build context using your existing logic
+        built = build_user_context(db, email=email)
+        user_id = built["user_id"]
+        ctx = built["context"]
+
+        sig = signature_for_context(ctx)
+
+        if not regenerate:
+            existing = (
+                db.query(LearningPlan)
+                .filter(LearningPlan.user_id == user_id,
+                        LearningPlan.input_signature == sig)
+                .order_by(LearningPlan.created_at.desc())
+                .first()
+            )
+            if existing:
+                print("plan job: deduped; existing plan returned")
+                return
+
+        plan = generate_learning_plan(ctx)
+
+        row = LearningPlan(
+            user_id=user_id,
+            input_signature=sig,
+            model=OPENAI_MODEL,
+            plan=plan
+        )
+        db.add(row)
+        db.commit()
+        print("plan job: created plan for user", user_id)
+
+    except Exception as e:
+        db.rollback()
+        print("plan job failed:", e)
+        raise
+    finally:
+        db.close()
+
 def generate_learning_plan(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    print("PLAN JOB STARTED:")
     if TEST_LLM:
         # test model
         return {
@@ -128,6 +186,7 @@ def generate_learning_plan(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     """Generate and persist a learning plan using the latest Typeform response for this user."""
     prompt = build_prompt(ctx)
+
     # Call the model 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
