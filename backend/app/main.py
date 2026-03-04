@@ -27,7 +27,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173",  # include both to be safe during dev
+        "http://127.0.0.1:5173", 
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -77,27 +77,40 @@ def extract_name_email_from_answers(answers: List[Dict[str, Any]]) -> Dict[str, 
     name = None
     email = None
 
-    name_refs  = {"name"}
-    email_refs = {"email"}
+    for a in answers or []:
+        t = a.get("type")
 
-    for ans in answers or []:
-        ref = (ans.get("field", {}) or {}).get("ref")
+        if t == "email":
+            val = a.get("email")
+            if val:
+                email = val.strip()
 
-        if ref in name_refs:
-            if "text" in ans and ans["text"]:
-                candidate = ans["text"].strip()
-                if candidate:
-                    name = candidate
+        if t == "text":
+            txt = (a.get("text") or "").strip()
+            if txt and not name:
+                name = txt
 
-        if ref in email_refs:
-            if "email" in ans and ans["email"]:
-                candidate = ans["email"].strip()
-                if candidate:
-                    email = candidate
+    # name_refs  = {"name"}
+    # email_refs = {"email"}
 
-        # if both found
-        if name and email:
-            break
+    # for ans in answers or []:
+    #     ref = (ans.get("field", {}) or {}).get("ref")
+
+    #     if ref in name_refs:
+    #         if "text" in ans and ans["text"]:
+    #             candidate = ans["text"].strip()
+    #             if candidate:
+    #                 name = candidate
+
+    #     if ref in email_refs:
+    #         if "email" in ans and ans["email"]:
+    #             candidate = ans["email"].strip()
+    #             if candidate:
+    #                 email = candidate
+
+    #     # if both found
+    #     if name and email:
+    #         break
 
     return {"name": name, "email": normalize_email(email)}
 
@@ -112,19 +125,17 @@ def get_or_create_user_by_email( db: Session, *, email: Optional[str], name: Opt
     email = email.strip().lower()
 
     user = db.query(User).filter(User.email == email).first()
-    if not user:
-        user = User(email=email, name=(name.strip() if name else None))
-        db.add(user)
-        return user, True, False
+    if user:
+        changed = False
+        if name and user.name != name:
+            user.name = name
+            changed = True
+        return user, False, changed
 
-    # update name if new info comes in
-    updated = False
-    incoming = (name or "").strip() or None
-    if incoming and user.name != incoming:
-        user.name = incoming
-        updated = True
+    user = User(email=email, name=name)
+    db.add(user)
 
-    return user, False, updated
+    return user, True, False
 
 @app.post("/webhooks/typeform/")
 @app.post("/webhooks/typeform")
@@ -140,21 +151,28 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
     form_id = frm.get("form_id")
     submission_id = payload.get("event_id") or frm.get("token")
     answers = frm.get("answers", []) or []
+    if isinstance(answers, str):
+        answers = json.loads(answers)
     hidden = frm.get("hidden", {}) or {}
 
     # Extract name & email from answers    
-    who = extract_name_email_from_answers(answers)
-    name = who["name"]
-    email = who["email"]
+    who = extract_name_email_from_answers(answers) or {}
+    name = who.get("name")
+    email = who.get("email")
 
     # build the new columns from answers
-    fields = extract_response_fields(answers)
+    fields = extract_response_fields(answers) or {}
+
+    email = email or fields.get("email") 
+    name = name or fields.get("name")
 
     # Upsert user first 
-    user = created = updated = None
+    # user = created = updated = None
     if email:
         user, created, updated = get_or_create_user_by_email(db, email=email, name=name)
         db.flush()
+        if user and user.id is None:
+            db.refresh(user)
         
     resp = db.query(TypeformResponse).filter(
         TypeformResponse.submission_id == submission_id
@@ -168,7 +186,11 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
             if hasattr(TypeformResponse, k):
                 setattr(resp, k, v)
         db.commit()
-        return {"ok": True, "updated": True, "submission_id": submission_id}
+        return {"ok": True, "updated": True, "submission_id": submission_id, "user_id": resp.user_id}
+
+    print("email:", email)
+    print("user:", user)
+    print("user.id:", getattr(user, "id", None))
 
     # Create a new response row
     create_kwargs = {
@@ -187,8 +209,53 @@ async def typeform_webhook(request: Request, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "created": True, "submission_id": submission_id}
 
-# Debug 
-@app.get("/debug/latest")
+
+# =========LEARNING PLAN===============
+@app.post("/plan/generate", response_model=LearningPlanResponse)
+def generate_plan(req: GeneratePlanRequest = Body(...), db: Session = Depends(get_db)):
+    # Build context from user responses
+    try:
+        built = build_user_context(db, email=req.email)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    user_id = built["user_id"]
+    ctx = built["context"]
+
+    # Create input signature to dedupe identical runs
+    sig = signature_for_context(ctx)
+    if not req.regenerate:
+        existing = (db.query(LearningPlan)
+                      .filter(LearningPlan.user_id == user_id,
+                              LearningPlan.input_signature == sig)
+                      .order_by(LearningPlan.created_at.desc())
+                      .first())
+        if existing:
+            return LearningPlanResponse(
+                user_id=str(user_id),
+                model=existing.model,
+                plan=existing.plan
+            )
+
+    # call openAI
+    plan = generate_learning_plan(ctx)
+
+    row = LearningPlan(
+        user_id=user_id,
+        input_signature=sig,
+        model=OPENAI_MODEL,
+        plan=plan
+    )
+    db.add(row)
+    db.commit()
+
+    return LearningPlanResponse(
+        user_id=str(user_id),
+        model=OPENAI_MODEL,
+        plan=plan
+    )
+
+# Find the latest plan
+@app.get("/plan/latest", response_model=LearningPlanResponse)
 def latest(email: str = Query(...), db: Session = Depends(get_db)):
     # find the user by email
     norm_email = email.strip().lower()
@@ -232,52 +299,6 @@ def latest(email: str = Query(...), db: Session = Depends(get_db)):
             }
         }
     }
-
-# =========LEARNING PLAN===============
-# router = APIRouter(prefix="/plan", tags=["plan"])
-
-@app.post("/plan/generate", response_model=LearningPlanResponse)
-def generate_plan(req: GeneratePlanRequest = Body(...), db: Session = Depends(get_db)):
-    # Build context from user responses
-    try:
-        built = build_user_context(db, email=req.email)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    user_id = built["user_id"]
-    ctx = built["context"]
-
-    # Create input signature to dedupe identical runs
-    sig = signature_for_context(ctx)
-    if not req.regenerate:
-        existing = (db.query(LearningPlan)
-                      .filter(LearningPlan.user_id == user_id,
-                              LearningPlan.input_signature == sig)
-                      .order_by(LearningPlan.created_at.desc())
-                      .first())
-        if existing:
-            return LearningPlanResponse(
-                user_id=str(user_id),
-                model=existing.model,
-                plan=existing.plan
-            )
-
-    # call openAI
-    plan = generate_learning_plan(ctx)
-
-    row = LearningPlan(
-        user_id=user_id,
-        input_signature=sig,
-        model=OPENAI_MODEL,
-        plan=plan
-    )
-    db.add(row)
-    db.commit()
-
-    return LearningPlanResponse(
-        user_id=str(user_id),
-        model=OPENAI_MODEL,
-        plan=plan
-    )
 
 # ------------ Google Auth helpers & routes ------------
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
@@ -471,7 +492,7 @@ async def google_callback(request: Request, response: Response, code: str, db: S
         key="session",
         value=token,
         httponly=True,       
-        secure=False,        
+        secure=False,  # change to 'True' in production      
         samesite="lax",
         max_age=7 * 24 * 3600,
         path="/",

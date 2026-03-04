@@ -81,20 +81,20 @@ export default function Dashboard() {
 
         {/* Main */}
         <main className="main">
-          {/* Hero: Goal + CTA */}
-          <section className="hero">
-            <div className="hero__copy">
-              <div className="eyebrow">Your Goal</div>
-              <h1 className="hero__title">{GOAL.title}</h1>
-              <p className="hero__meta">
+          {/* Goal */}
+          <section className="goal">
+            <div className="goal__copy">
+              <div className="goal__label">Your Goal</div>
+              <h1 className="goal__title">{GOAL.title}</h1>
+              <p className="goal__meta">
                 Deadline: <b>{GOAL.deadline}</b>
               </p>
-              <Link to="/dashboard/plan" className="btn btn--light hero__cta">
+              <Link to="/dashboard/plan" className="btn btn--light goal__cta">
                 View Study Plan →
               </Link>
 
             </div>
-            <div className="hero__meter">
+            <div className="goal__meter">
               <div className="meter__label">Weekly Target</div>
               <Ring percent={weeklyPct} />
             </div>

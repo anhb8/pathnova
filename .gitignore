@@ -1,6 +1,9 @@
 frontend/node_modules
 frontend/dist
 backend/venv
+frontend/venv
 __pycache__/
 .env
+venv/
+.venv/
 .DS_Store
